@@ -287,12 +287,39 @@ func assignDownloadFields(
 
 func strPtr(s string) *string { return &s }
 
+// canonicalExtensions pins the extension for the mime types WhatsApp actually
+// sends, so the result does not depend on the host's mime database.
+//
+// This exists because mime.ExtensionsByType is platform-dependent: on Windows
+// it reads HKEY_CLASSES_ROOT\MIME\Database\Content Type\<type> and returns the
+// matches sorted alphabetically. For image/jpeg that yields ".jfif" before
+// ".jpeg"/".jpg", so downloads landed as .jfif — an extension many tools refuse
+// to treat as an image, even though the bytes are ordinary JPEG. On Linux/macOS
+// the same call returns ".jpeg", which is why this went unnoticed upstream.
+var canonicalExtensions = map[string]string{
+	"image/jpeg":      ".jpg",
+	"image/png":       ".png",
+	"image/gif":       ".gif",
+	"image/webp":      ".webp",
+	"video/mp4":       ".mp4",
+	"video/3gpp":      ".3gp",
+	"audio/ogg":       ".ogg",
+	"audio/mpeg":      ".mp3",
+	"audio/mp4":       ".m4a",
+	"audio/amr":       ".amr",
+	"application/pdf": ".pdf",
+}
+
 // extensionForMime returns a filesystem extension for a given mime type,
 // falling back to type-based defaults and finally ".bin".
 func extensionForMime(mt, msgType string) string {
 	if mt != "" {
 		if i := strings.IndexByte(mt, ';'); i >= 0 {
 			mt = strings.TrimSpace(mt[:i])
+		}
+		mt = strings.ToLower(strings.TrimSpace(mt))
+		if ext, ok := canonicalExtensions[mt]; ok {
+			return ext
 		}
 		if exts, _ := mime.ExtensionsByType(mt); len(exts) > 0 {
 			return exts[0]
