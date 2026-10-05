@@ -9,8 +9,9 @@
 //
 // This file provides:
 //
-//   1. extractDownloadableFields(evt) — pulls media_key + URL + sha + length
-//      + mime out of any media-bearing message uniformly. Used by onMessage
+//   1. extractFromMessage(m) (history_sync.go) — pulls media_key + URL + sha
+//      + length + mime out of any media-bearing message uniformly, after
+//      unwrapping FutureProofMessage wrappers. Used by onMessage
 //      so all image/video/document/sticker/audio rows persist the fields
 //      needed to re-download later.
 //
@@ -44,7 +45,6 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/types/events"
 )
 
 // mediaFields holds the persisted columns the bridge needs to re-download
@@ -62,7 +62,7 @@ type mediaFields struct {
 
 // downloadable is the minimum interface every media-bearing protobuf message
 // implements. Pulled out only to deduplicate the per-type field copy in
-// extractDownloadableFields without losing concrete types.
+// extractFromMessage without losing concrete types.
 type downloadable interface {
 	GetMediaKey() []byte
 	GetFileEncSHA256() []byte
@@ -95,27 +95,6 @@ func fieldsFrom(m downloadable) mediaFields {
 		f.MediaMime = sql.NullString{String: mt, Valid: true}
 	}
 	return f
-}
-
-// extractDownloadableFields pulls the download-relevant fields out of any
-// media-bearing message. Returns ok=false for text/system/reaction/etc.
-func extractDownloadableFields(evt *events.Message) (mediaFields, bool) {
-	if m := evt.Message.GetImageMessage(); m != nil {
-		return fieldsFrom(m), true
-	}
-	if m := evt.Message.GetVideoMessage(); m != nil {
-		return fieldsFrom(m), true
-	}
-	if m := evt.Message.GetDocumentMessage(); m != nil {
-		return fieldsFrom(m), true
-	}
-	if m := evt.Message.GetAudioMessage(); m != nil {
-		return fieldsFrom(m), true
-	}
-	if m := evt.Message.GetStickerMessage(); m != nil {
-		return fieldsFrom(m), true
-	}
-	return mediaFields{}, false
 }
 
 // DownloadMedia fetches + decrypts the media bytes for a stored message,

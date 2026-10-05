@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Bridge wraps a whatsmeow.Client and writes WhatsApp events into our SQLite database.
@@ -219,7 +221,13 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	id := evt.Info.ID
 	ts := evt.Info.Timestamp.Unix()
 
-	content, msgType := extractContent(evt)
+	msg := unwrapMessage(evt.Message)
+	content, msgType := extractContent(msg)
+	if msgType == "system" {
+		// Field names only (no content); raw shows the pre-UnwrapRaw wrappers.
+		log.Printf("onMessage: unhandled message shape id=%s chat=%s fields=%v raw=%v",
+			id, chatJID, messageFieldNames(msg), messageFieldNames(evt.RawMessage))
+	}
 	normalized := Normalize(content)
 	scrubbed, flags := Scrub(content)
 
@@ -249,7 +257,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	// only available at the moment of receipt — any consumer that wakes up
 	// later (receipts pipeline, vision OCR, vault export with attachments)
 	// has no way to recover the bytes. See media_download.go.
-	mfields, _ := extractDownloadableFields(evt)
+	mfields, _ := extractFromMessage(msg)
 
 	// Insert message. Media columns are populated for image/video/document/
 	// audio/sticker; for text/system/reaction etc. they go in as NULL.
@@ -314,7 +322,7 @@ func (b *Bridge) onMessage(evt *events.Message) {
 	// Enqueue voice-note transcription. Fire-and-forget; the transcriber
 	// writes back to messages.voice_note_transcript when done.
 	if b.transcriber != nil && (msgType == "voice" || msgType == "audio") {
-		if audio := evt.Message.GetAudioMessage(); audio != nil {
+		if audio := msg.GetAudioMessage(); audio != nil {
 			audioMsg := audio // closure capture
 			client := b.client
 			b.transcriber.Enqueue(transcriptionJob{
@@ -381,8 +389,55 @@ func chatTypeFromJID(j types.JID) string {
 	}
 }
 
-func extractContent(evt *events.Message) (text, msgType string) {
-	m := evt.Message
+var futureProofName = (&waE2E.FutureProofMessage{}).ProtoReflect().Descriptor().FullName()
+
+// maxUnwrapDepth bounds wrapper recursion; real messages nest 2-3 deep.
+const maxUnwrapDepth = 8
+
+// unwrapMessage peels every wrapper whatsmeow's UnwrapRaw leaves in place
+// (associatedChildMessage for album items, groupMentionedMessage,
+// spoilerMessage, botForwardedMessage, ...) by descending into any set
+// FutureProofMessage or DeviceSentMessage field. Generic on purpose:
+// WhatsApp keeps adding FutureProofMessage wrappers, and a hard-coded list
+// is how album documents ended up stored as "system" with no media key.
+// History-sync protos are never unwrapped by whatsmeow, so this also
+// covers documentWithCaption/ephemeral/viewOnce there.
+func unwrapMessage(m *waE2E.Message) *waE2E.Message {
+	for depth := 0; m != nil && depth < maxUnwrapDepth; depth++ {
+		inner := m.GetDeviceSentMessage().GetMessage()
+		if inner == nil {
+			m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+				if fd.IsList() || fd.Message() == nil || fd.Message().FullName() != futureProofName {
+					return true
+				}
+				inner = v.Message().Interface().(*waE2E.FutureProofMessage).GetMessage()
+				return inner == nil
+			})
+		}
+		if inner == nil {
+			return m
+		}
+		m = inner
+	}
+	return m
+}
+
+// messageFieldNames lists the proto field names set on m — type names only,
+// never values — so unhandled message shapes can be diagnosed from the log.
+func messageFieldNames(m *waE2E.Message) []string {
+	var names []string
+	if m == nil {
+		return names
+	}
+	m.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		names = append(names, string(fd.Name()))
+		return true
+	})
+	return names
+}
+
+// extractContent expects an already-unwrapped message (see unwrapMessage).
+func extractContent(m *waE2E.Message) (text, msgType string) {
 	switch {
 	case m.GetConversation() != "":
 		return m.GetConversation(), "text"

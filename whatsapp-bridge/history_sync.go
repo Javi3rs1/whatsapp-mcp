@@ -50,8 +50,10 @@ import (
 // extractFromMessage is the inner-type variant of extractDownloadableFields.
 // Live receive (events.Message) wraps the proto in evt.Message; HistorySync
 // delivery wraps it in HistorySyncMsg.GetMessage().GetMessage(). Both reach
-// the same *waE2E.Message, so both paths share this helper.
+// the same *waE2E.Message, so both paths share this helper. Wrappers are
+// peeled here because history-sync protos arrive un-unwrapped.
 func extractFromMessage(m *waE2E.Message) (mediaFields, bool) {
+	m = unwrapMessage(m)
 	if m == nil {
 		return mediaFields{}, false
 	}
@@ -108,14 +110,23 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				continue
 			}
 			mediaSeen++
+			caption, msgType := extractContent(unwrapMessage(wm.GetMessage()))
+			scrubbed, flags := Scrub(caption)
 
 			// Only fill in fields that are currently NULL. This protects
 			// rows where the live receive path already captured them
 			// (post-patch messages). It also makes overlapping HistorySync
-			// chunks idempotent.
+			// chunks idempotent. Rows stored as "system" because the live
+			// path missed a wrapper (e.g. album children) also get their
+			// real type + caption, so /api/media/download accepts them.
 			res, err := b.db.Exec(`
 				UPDATE messages
-				   SET media_key            = COALESCE(media_key, ?),
+				   SET content_text         = CASE WHEN type = 'system' AND COALESCE(content_text, '') = '' THEN ? ELSE content_text END,
+				       content_normalized   = CASE WHEN type = 'system' AND COALESCE(content_text, '') = '' THEN ? ELSE content_normalized END,
+				       scrubbed_text        = CASE WHEN type = 'system' AND COALESCE(content_text, '') = '' THEN ? ELSE scrubbed_text END,
+				       scrub_flags_json     = CASE WHEN type = 'system' AND COALESCE(content_text, '') = '' THEN ? ELSE scrub_flags_json END,
+				       type                 = CASE WHEN type = 'system' THEN ? ELSE type END,
+				       media_key            = COALESCE(media_key, ?),
 				       media_direct_path    = COALESCE(media_direct_path, ?),
 				       media_url            = COALESCE(media_url, ?),
 				       media_enc_sha256     = COALESCE(media_enc_sha256, ?),
@@ -126,6 +137,7 @@ func (b *Bridge) processHistorySyncEvent(evt *events.HistorySync) {
 				 WHERE id = ?
 				   AND media_key IS NULL
 			`,
+				caption, Normalize(caption), scrubbed, ScrubFlagsJSON(flags), msgType,
 				fields.MediaKey, fields.MediaDirectPath, fields.MediaURL,
 				fields.MediaEncSHA, fields.MediaSHA, fields.MediaFileLength,
 				fields.MediaKeyTimestamp, fields.MediaMime, key.GetID(),
